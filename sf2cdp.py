@@ -5,7 +5,9 @@ import getpass
 from datetime import datetime
 import subprocess
 import snowflake.connector
-from google.cloud import bigquery
+from google.cloud import bigquery, storage
+import json
+import gzip
 
 if len(sys.argv) != 5:
     print("Usage: python sf2cdp_1.py <database> <schema> <table_name> <env>")
@@ -104,6 +106,77 @@ def move_files_via_gsutil(source_bucket_name, source_blob_name, destination_buck
 # Move files and get the moved path
 moved_blob_path = move_files_via_gsutil(source_bucket_name, source_blob_name, target_bucket_name, destination_blob_name)
 
+def infer_schema_from_json_sample(client, gcs_uri):
+    """Fetch sample JSON objects from multiple GCS files and infer the combined BigQuery schema."""
+    storage_client = storage.Client()
+    # Parse the bucket name and prefix from the GCS URI
+    bucket_name = gcs_uri.split('/')[2]
+    prefix = '/'.join(gcs_uri.split('/')[3:]).rstrip('/*') + '/'
+    # List blobs (files) in the GCS path
+    blobs = storage_client.list_blobs(bucket_name, prefix=prefix)
+
+    combined_schema = {}
+    file_count = 0  # Count how many files are found
+
+    for blob in blobs:
+        file_count += 1
+        if blob.name.endswith('.json.gz'):
+            with blob.open("rb") as f:
+                with gzip.GzipFile(fileobj=f) as gz:
+                    for line in gz:
+                        sample_data = json.loads(line.decode('utf-8'))
+                        # Update the combined schema based on the current file
+                        for key, value in sample_data.items():
+                            if key not in combined_schema:
+                                if isinstance(value, str):
+                                    # Try to parse as DATE
+                                    try:
+                                        parsed_date = datetime.strptime(value, '%Y-%m-%d')
+                                        combined_schema[key] = 'DATE'
+                                    except ValueError:
+                                        # Not a valid DATE, check for TIMESTAMP
+                                        try:
+                                            parsed_timestamp = datetime.strptime(value, '%Y-%m-%dT%H:%M:%S')
+                                            combined_schema[key] = 'TIMESTAMP'
+                                        except ValueError:
+                                            # Not a valid TIMESTAMP, fallback to STRING
+                                            combined_schema[key] = 'STRING'
+                                if isinstance(value, str):
+                                    combined_schema[key] = 'STRING'
+                                elif isinstance(value, int):
+                                    combined_schema[key] = 'INT64'
+                                elif isinstance(value, float):
+                                    combined_schema[key] = 'FLOAT64'
+                                elif isinstance(value, bool):
+                                    combined_schema[key] = 'BOOLEAN'
+                                elif isinstance(value, dict):
+                                    combined_schema[key] = 'STRING'  # Assume nested objects are serialized as strings
+                                else:
+                                    combined_schema[key] = 'STRING'
+                        # Stop after the first 10 lines for schema inference if files are large
+                        if file_count >= 10:
+                            break
+    print(file_count)
+    if file_count == 0:
+        raise ValueError("No files found in the specified GCS path.")
+    
+    if not combined_schema:
+        raise ValueError("No JSON data found in the specified GCS path.")
+
+    # Convert the combined schema dictionary to BigQuery SchemaField list
+    schema = [bigquery.SchemaField(name=key, field_type=field_type) for key, field_type in combined_schema.items()]
+
+    # Print the final schema (optional)
+    print("Inferred Schema:")
+    for field in schema:
+        print(f"Column: {field.name}, Type: {field.field_type}")
+
+    return schema
+
+
+
+
+
 if moved_blob_path:
     # Load data from GCS into BigQuery
     client = bigquery.Client(project=f"atd-cdp-{env}")
@@ -112,14 +185,28 @@ if moved_blob_path:
     table_ref = client.dataset(dataset_id).table(table_id)
 
     # Define the job configuration for loading data into BigQuery
+    # job_config = bigquery.LoadJobConfig(
+    #     source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+    #     autodetect=True,
+    #     write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE  # Replace table data
+    # )
+    gcs_uri = f"gs://{target_bucket_name}/{moved_blob_path}"
+
+    try:
+        schema = infer_schema_from_json_sample(client, gcs_uri)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
     job_config = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-        autodetect=True,
+        schema=schema,
+        autodetect=False,
         write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE  # Replace table data
     )
 
     # Load data into BigQuery
-    gcs_uri = f"gs://{target_bucket_name}/{moved_blob_path}"
+    
     load_job = client.load_table_from_uri(
         gcs_uri,
         table_ref,
