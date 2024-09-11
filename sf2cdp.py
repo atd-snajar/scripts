@@ -129,22 +129,9 @@ def infer_schema_from_json_sample(client, gcs_uri):
                         for key, value in sample_data.items():
                             if key not in combined_schema:
                                 if isinstance(value, str):
-                                    # Try to parse as DATE
-                                    try:
-                                        parsed_date = datetime.strptime(value, '%Y-%m-%d')
-                                        combined_schema[key] = 'DATE'
-                                    except ValueError:
-                                        # Not a valid DATE, check for TIMESTAMP
-                                        try:
-                                            parsed_timestamp = datetime.strptime(value, '%Y-%m-%dT%H:%M:%S')
-                                            combined_schema[key] = 'TIMESTAMP'
-                                        except ValueError:
-                                            # Not a valid TIMESTAMP, fallback to STRING
-                                            combined_schema[key] = 'STRING'
-                                if isinstance(value, str):
                                     combined_schema[key] = 'STRING'
                                 elif isinstance(value, int):
-                                    combined_schema[key] = 'INT64'
+                                    combined_schema[key] = 'INTEGER'
                                 elif isinstance(value, float):
                                     combined_schema[key] = 'FLOAT64'
                                 elif isinstance(value, bool):
