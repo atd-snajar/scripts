@@ -73,7 +73,7 @@ FROM (
 FILE_FORMAT = (TYPE = 'JSON', COMPRESSION = 'AUTO')
 OVERWRITE = TRUE
 SINGLE = FALSE
-MAX_FILE_SIZE = 4900000000
+MAX_FILE_SIZE = 10485760 
 HEADER = FALSE
 """
 
@@ -88,12 +88,13 @@ source_blob_name = f'{snowflake_schema.lower()}/{snowflake_tablename.lower()}/lo
 destination_blob_name = source_blob_name
 
 def move_files_via_gsutil(source_bucket_name, source_blob_name, destination_bucket_name, destination_blob_name):
+    print(destination_blob_name)
     source_path = f"gs://{source_bucket_name}/{source_blob_name}"
-    destination_path = f"gs://{destination_bucket_name}/{destination_blob_name}".rstrip('/*')
-
+    destination_path = f"gs://{destination_bucket_name}/{destination_blob_name}".rstrip('*')
+    print(destination_path)
     # Construct the gsutil mv command
-    command = ['gsutil', '-m', 'mv', source_path, destination_path]
-
+    command = ['gsutil', '-m', 'cp', source_path, destination_path]
+    print(command)
     try:
         # Run the gsutil mv command
         result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -102,48 +103,138 @@ def move_files_via_gsutil(source_bucket_name, source_blob_name, destination_buck
     except subprocess.CalledProcessError as e:
         print(f"Error moving files: {e.stderr.decode('utf-8')}")
         return None
+    
 
 # Move files and get the moved path
 moved_blob_path = move_files_via_gsutil(source_bucket_name, source_blob_name, target_bucket_name, destination_blob_name)
 
-def infer_schema_from_json_sample(client, gcs_uri):
-    """Fetch sample JSON objects from multiple GCS files and infer the combined BigQuery schema."""
+# def infer_schema_from_json_sample(client, gcs_uri):
+#     """Fetch sample JSON objects from multiple GCS files and infer the combined BigQuery schema."""
+#     storage_client = storage.Client()
+#     # Parse the bucket name and prefix from the GCS URI
+#     bucket_name = gcs_uri.split('/')[2]
+#     prefix = '/'.join(gcs_uri.split('/')[3:]).rstrip('/*') + '/'
+#     # List blobs (files) in the GCS path
+#     blobs = storage_client.list_blobs(bucket_name, prefix=prefix)
+
+#     combined_schema = {}
+#     file_count = 0  # Count how many files are found
+
+#     for blob in blobs:
+#         file_count += 1
+#         if blob.name.endswith('.json.gz'):
+#             with blob.open("rb") as f:
+#                 with gzip.GzipFile(fileobj=f) as gz:
+#                     for line in gz:
+#                         sample_data = json.loads(line.decode('utf-8'))
+#                         # Update the combined schema based on the current file
+#                         for key, value in sample_data.items():
+#                             if key not in combined_schema:
+#                                 if isinstance(value, str):
+#                                     combined_schema[key] = 'STRING'
+#                                 elif isinstance(value, int):
+#                                     combined_schema[key] = 'INTEGER'
+#                                 elif isinstance(value, float):
+#                                     combined_schema[key] = 'FLOAT64'
+#                                 elif isinstance(value, bool):
+#                                     combined_schema[key] = 'BOOLEAN'
+#                                 elif isinstance(value, dict):
+#                                     combined_schema[key] = 'STRING'  # Assume nested objects are serialized as strings
+#                                 else:
+#                                     combined_schema[key] = 'STRING'
+#                         # Stop after the first 10 lines for schema inference if files are large
+#                         if file_count >= 200:
+#                             break
+#     print(file_count)
+#     if file_count == 0:
+#         raise ValueError("No files found in the specified GCS path.")
+    
+#     if not combined_schema:
+#         raise ValueError("No JSON data found in the specified GCS path.")
+
+#     # Convert the combined schema dictionary to BigQuery SchemaField list
+#     schema = [bigquery.SchemaField(name=key, field_type=field_type) for key, field_type in combined_schema.items()]
+
+#     # Print the final schema (optional)
+#     print("Inferred Schema:")
+#     for field in schema:
+#         print(f"Column: {field.name}, Type: {field.field_type}")
+
+#     return schema
+
+def infer_schema_from_json_sample(client, gcs_uri, file_limit=50, line_limit=1000000000):
+    """
+    Fetch sample JSON objects from multiple GCS files and infer the combined BigQuery schema.
+    
+    :param client: BigQuery client
+    :param gcs_uri: GCS path where JSON files are stored
+    :param file_limit: Max number of files to sample
+    :param line_limit: Max number of lines (records) to sample per file
+    :return: Inferred schema as a list of BigQuery SchemaField objects
+    """
     storage_client = storage.Client()
+    
     # Parse the bucket name and prefix from the GCS URI
     bucket_name = gcs_uri.split('/')[2]
     prefix = '/'.join(gcs_uri.split('/')[3:]).rstrip('/*') + '/'
+    
     # List blobs (files) in the GCS path
     blobs = storage_client.list_blobs(bucket_name, prefix=prefix)
 
     combined_schema = {}
+    column_type_tracker = {}  # Track types for each column
     file_count = 0  # Count how many files are found
+    total_lines = 0  # Count how many lines have been processed
 
     for blob in blobs:
         file_count += 1
+        if file_count > file_limit:
+            break  # Stop processing if file limit is reached
+        
         if blob.name.endswith('.json.gz'):
             with blob.open("rb") as f:
                 with gzip.GzipFile(fileobj=f) as gz:
+                    line_count = 0
                     for line in gz:
                         sample_data = json.loads(line.decode('utf-8'))
+                        
                         # Update the combined schema based on the current file
                         for key, value in sample_data.items():
                             if key not in combined_schema:
+                                # Set initial type for the column
                                 if isinstance(value, str):
                                     combined_schema[key] = 'STRING'
-                                elif isinstance(value, int):
-                                    combined_schema[key] = 'INTEGER'
-                                elif isinstance(value, float):
-                                    combined_schema[key] = 'FLOAT64'
+                                    column_type_tracker[key] = 'STRING'
                                 elif isinstance(value, bool):
                                     combined_schema[key] = 'BOOLEAN'
+                                    column_type_tracker[key] = 'BOOLEAN'
                                 elif isinstance(value, dict):
                                     combined_schema[key] = 'STRING'  # Assume nested objects are serialized as strings
+                                    column_type_tracker[key] = 'STRING'
+                                elif isinstance(value, int):
+                                    combined_schema[key] = 'INTEGER'
+                                    column_type_tracker[key] = 'INTEGER'
+                                elif isinstance(value, float):
+                                    combined_schema[key] = 'FLOAT64'
+                                    column_type_tracker[key] = 'FLOAT64'
                                 else:
                                     combined_schema[key] = 'STRING'
-                        # Stop after the first 10 lines for schema inference if files are large
-                        if file_count >= 10:
-                            break
-    print(file_count)
+                                    column_type_tracker[key] = 'STRING'
+                            else:
+                                # Adjust the column type if needed
+                                if isinstance(value, float) and column_type_tracker[key] == 'INTEGER':
+                                    # If a float is found, promote the column to FLOAT64
+                                    combined_schema[key] = 'FLOAT64'
+                                    column_type_tracker[key] = 'FLOAT64'
+
+                        line_count += 1
+                        total_lines += 1
+                        
+                        if line_count >= line_limit:
+                            break  # Stop reading after hitting the line limit per file
+
+    print(f"Processed {file_count} files and {total_lines} lines.")
+
     if file_count == 0:
         raise ValueError("No files found in the specified GCS path.")
     
